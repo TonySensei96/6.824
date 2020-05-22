@@ -33,24 +33,24 @@ type Op struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu      		sync.Mutex
+	me      		int
+	rf      		*raft.Raft
+	applyCh 		chan raft.ApplyMsg
 
-	maxraftstate int // snapshot if log grows this big
-	persist *raft.Persister // Persister to persist the state of the kv server.
+	maxraftstate 	int // snapshot if log grows this big
+	persist 		*raft.Persister // Persister to persist the state of the kv server.
 
 	// Your definitions here.
-	db 		map[string]string // Simple database for key/value pairs
+	db 				map[string]string // Simple database for key/value pairs
 	// A map of channel for each log index in the k/v services
 	// with this we can know which operation message to wait for
 	// by specifying the log index of that operation. Then, we can
 	// have a channel for that index to wait until the message is
 	// finished to return from the kv service.
-	chMap 	map[int]chan Op
-	cid2Seq	map[int64]int
-	killCh	chan bool
+	chMap 			map[int]chan Op
+	cid2Seq			map[int64]int
+	killCh			chan bool
 }
 
 // RPC handler for Get
@@ -60,25 +60,31 @@ type KVServer struct {
 // loop must be in a backend service method, which is not here,
 // because this is a client-facing method.
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	originOp := Op{
+	originalOp := Op{
 		OpType: "Get",
-		Key: 	args.Key,
-		Value: strconv.FormatInt(nrand(), 10),
+		Key:    args.Key,
+		Value:  strconv.FormatInt(nrand(), 10),
 	}
-	// Checks if this is a wrong leader, if not, just return.
+
 	reply.WrongLeader = true
-	index, _, isLeader := kv.rf.Start(originOp)
+
+	// Checks if this is a wrong leader, if not, just return.
+	// Use of the start function here to communicate to the
+	// raft directly to append the operation log entry to the
+	// leader, and also propagate the new log entry to the followers.
+	index, _, isLeader := kv.rf.Start(originalOp)
 	if !isLeader {
 		return
 	}
+
 	ch := kv.putIfAbsent(index)
-	op := beNotified(ch)
-	if equalOp(op, originOp) {
+	op := beNotified(ch) // Waiting for a reply of confirming finishing the operation.
+
+	if equalOp(op, originalOp) {
 		reply.WrongLeader = false
 		kv.mu.Lock()
+		defer kv.mu.Unlock()
 		reply.Value = kv.db[op.Key]
-		kv.mu.Unlock()
-		return
 	}
 }
 
@@ -89,24 +95,26 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 // loop must be in a backend service method, which is not here,
 // because this is a client-facing method.
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	originOp := Op{
+	originalOp := Op{
 		OpType: args.Op,
-		Key: 	args.Key,
-		Value: 	args.Value,
-		Cid: 	args.Cid,
+		Key:    args.Key,
+		Value:  args.Value,
+		Cid:   	args.Cid,
 		SeqNum: args.SeqNum,
 	}
-	// Checks if this is a wrong leader, if not, just return.
+
 	reply.WrongLeader = true
-	index, _, isLeader := kv.rf.Start(originOp)
+
+	// Checks if this is a wrong leader, if not, just return.
+	index, _, isLeader := kv.rf.Start(originalOp)
 	if !isLeader {
 		return
 	}
+
 	ch := kv.putIfAbsent(index)
-	op := beNotified(ch)
-	if equalOp(op, originOp) {
+	op := beNotified(ch) // Waiting for a reply of confirming finishing the operation.
+	if equalOp(op, originalOp) {
 		reply.WrongLeader = false
-		return
 	}
 }
 
@@ -158,12 +166,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// The following code should be in a long-running go routine
 	// because this function must return quickly.
 	go func() {
-		for  {
+		for {
 			select {
 			case <- kv.killCh:
 				return
 			case applyMsg := <- kv.applyCh:
-
+				// If the apply message tells the kv server to read from a
+				// snapshot, then read from the snapshot and continue
+				// the applied loop.
 				if applyMsg.UseSnapShot {
 					kv.readSnapShot(applyMsg.SnapShot)
 					continue
@@ -175,7 +185,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				maxSeq, found := kv.cid2Seq[op.Cid]
 				if !found || op.SeqNum > maxSeq {
 					switch op.OpType {
-					case "Put":
+					case "Put" :
 						kv.db[op.Key] = op.Value
 					case "Append":
 						kv.db[op.Key] += op.Value
@@ -216,7 +226,7 @@ func (kv *KVServer) putIfAbsent(idx int) chan Op {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if _, ok := kv.chMap[idx]; !ok {
-		kv.chMap[idx] = make(chan Op, 1)
+		kv.chMap[idx] = make(chan Op, 1) // A 1 buffer channel here to avoid sender block.
 	}
 	return kv.chMap[idx]
 }
@@ -224,13 +234,14 @@ func (kv *KVServer) putIfAbsent(idx int) chan Op {
 // Checks if two operations are the same.
 func equalOp(a Op, b Op) bool {
 	return a.Key == b.Key && a.Value == b.Value &&
-		a.OpType == b.OpType && a.SeqNum == b.SeqNum && a.Cid == b.Cid
+		a.SeqNum == b.SeqNum && a.Cid == b.Cid && a.OpType == b.OpType
 }
 
 // A helper function to wait an operation for the channel for that index until timeout.
 func beNotified(ch chan Op) Op {
+	// Wait until a one second timeout.
 	select {
-	case op := <- ch :
+	case op := <- ch:
 		return op
 	case <- time.After(time.Second):
 		return Op{}
@@ -242,15 +253,15 @@ func beNotified(ch chan Op) Op {
 func (kv *KVServer) readSnapShot(snapshot []byte) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if snapshot == nil || len(snapshot) < 1 {
+	if snapshot == nil || len(snapshot) == 0 {
 		return
 	}
-	r:= bytes.NewBuffer(snapshot)
+	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var db map[string]string
 	var cid2Seq map[int64]int
 	if d.Decode(&db) != nil || d.Decode(&cid2Seq) != nil {
-		log.Fatalf("readPersist ERROR for server %v", kv.me)
+		log.Fatalf("ERROR: Cannot decode the db and cid2Seq for %v", kv.me)
 	} else {
 		kv.db, kv.cid2Seq = db, cid2Seq
 	}
@@ -262,9 +273,7 @@ func (kv *KVServer) readSnapShot(snapshot []byte) {
 func (kv *KVServer) needSnapshot() bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	threshold := 10
-	return kv.maxraftstate > 0 &&
-		kv.maxraftstate - kv.persist.RaftStateSize() < kv.maxraftstate/threshold
+	return kv.maxraftstate > 0 && kv.maxraftstate - kv.persist.RaftStateSize() < 1
 }
 
 // Encodes the database and the sequence number map for each client request

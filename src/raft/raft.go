@@ -409,14 +409,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// match, it should return conflictTerm = log[prevLogIndex].Term, and then
 	// search its log for the first index whose entry has term equal to
 	// conflictTerm.
-	prevLogIndexTerm := -1
+	prevLogIndexTerm := NULL
 	logSize := rf.logLen()
 	if args.PrevLogIndex >= rf.lastIncludedIndex && args.PrevLogIndex < logSize {
 		prevLogIndexTerm = rf.getLog(args.PrevLogIndex).Term
 	}
 	if prevLogIndexTerm != args.PrevLogTerm {
 		reply.ConflictIndex = logSize
-		if prevLogIndexTerm != -1 { // The follower has prevLogIndex
+		if prevLogIndexTerm != NULL { // The follower has prevLogIndex
 			reply.ConflictTerm = prevLogIndexTerm
 			for i := rf.lastIncludedIndex; i < logSize; i++ {
 				if rf.getLog(i).Term == reply.ConflictTerm {
@@ -456,6 +456,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 5. If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
+	// This is for a follower to update the commit index and last applied log index.
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, rf.getLastLogIndex())
 		rf.updateLastApplied()
@@ -478,6 +479,8 @@ func (rf *Raft) startAppendLog() {
 					return
 				}
 
+				// To prevent the follower's log to be too far
+				// behind the leader's last included index.
 				if rf.nextIndex[idx] - rf.lastIncludedIndex < 1 {
 					rf.sendSnapshot(idx)
 					return
@@ -537,12 +540,12 @@ func (rf *Raft) startAppendLog() {
 						for i := rf.lastIncludedIndex; i < logSize; i++ {
 							if rf.getLog(i).Term != reply.ConflictTerm {
 								continue
-							} else {
-								for i < logSize && rf.getLog(i).Term != reply.ConflictTerm {
-									i++
-								}
-								tarIndex = i
 							}
+							for i < logSize && rf.getLog(i).Term == reply.ConflictTerm {
+								i++
+							}
+							// Beyond the index of the last entry in that term in its log.
+							tarIndex = i
 						}
 					}
 
@@ -555,6 +558,7 @@ func (rf *Raft) startAppendLog() {
 	}
 }
 
+// For a Leader:
 // If there exists an N such that N > commitIndex, a majority
 // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 // set commitIndex = N
@@ -644,7 +648,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
 
-	// Your code here (2B).
+	// If the current server is the leader, that means it should
+	// accept the incoming operation. Then, we should initializes
+	// a new log, and append the new log to the leader's log
+	// entries. Finally, we should persist the current state of the
+	// leader, and also propagate the new log entries to all the
+	// followers.
 	if isLeader {
 		index = rf.getLastLogIndex() + 1
 		newLog := Log{
