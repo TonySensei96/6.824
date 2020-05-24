@@ -44,7 +44,6 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-	UseSnapShot	 bool 	// Indicate whether or not to use snapshot for this apply message.
 	SnapShot 	 []byte // The actual bytes of the snapshot.
 }
 
@@ -141,28 +140,6 @@ func (rf *Raft) encodeRaftState() []byte {
 // A function to persist the state of the raft with a snapshot.
 func (rf *Raft) persistWithSnapShot(snapshot []byte) {
 	rf.persister.SaveStateAndSnapshot(rf.encodeRaftState(), snapshot)
-}
-
-// Excluding the old log entries and persist with the given snapshot.
-func (rf *Raft) DoSnapShot(curIdx int, snapshot []byte)  {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// Every log entries preceding the "curIdx" must be discarded,
-	// so this boundary check is necessary.
-	if curIdx <= rf.lastIncludedIndex {
-		return
-	}
-
-	newLog := make([]Log, 0)
-	newLog = append(newLog, rf.log[curIdx - rf.lastIncludedIndex:]...)
-
-	// update last include index and term'
-	rf.lastIncludedIndex = curIdx
-	rf.lastIncludedTerm = rf.getLog(curIdx).Term
-	rf.log = newLog
-
-	rf.persistWithSnapShot(snapshot)
 }
 
 //
@@ -386,18 +363,35 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 // AppendEntries RPC handler implementation according to the paper's Figure 2
+// The follower should have the appendLogCh notify that the append entries
+// was finished to avoid timeout and restart election inappropriately.
+// The things to do in this function are the followings:
+// 1. This function should have a lock to avoid race conditions.
+// 2. If the current server is not up-to-date, then it should be converted
+// to follower immediately.
+// 3. Initializes the reply.
+// 4. If there is a term conflict, then it should find the conflict index
+// and return false immediately.
+// 5. Also reply false if the follower's term is leading the argument's term.
+// 6. If an existing entry conflicts with a new one (same index
+// but different terms), delete the existing entry and all that follow it (§5.3)
+// 7. If leaderCommit > commitIndex, set commitIndex =
+// min(leaderCommit, index of last new entry)
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer send(rf.appendLogCh)
+
 	// all servers rules
-	if args.Term > rf.currentTerm { // Set the current server as follower and keep term up-to-date
+	// Set the current server as follower and keep term up-to-date
+	if args.Term > rf.currentTerm {
 		rf.beFollower(args.Term)
 	}
+
 	reply.Term = rf.currentTerm
-	reply.Success = false
-	reply.ConflictTerm = NULL
 	reply.ConflictIndex = 0
+	reply.ConflictTerm = NULL
+	reply.Success = false
 
 	// 1. Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
@@ -416,7 +410,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if prevLogIndexTerm != args.PrevLogTerm {
 		reply.ConflictIndex = logSize
-		if prevLogIndexTerm != NULL { // The follower has prevLogIndex
+		if prevLogIndexTerm != NULL {
 			reply.ConflictTerm = prevLogIndexTerm
 			for i := rf.lastIncludedIndex; i < logSize; i++ {
 				if rf.getLog(i).Term == reply.ConflictTerm {
@@ -427,6 +421,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		return
 	}
+
 
 	// 2. Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -445,6 +440,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.persist()
 			break
 		}
+
 		// Same index but different term
 		if rf.getLog(index).Term != args.Entries[i].Term {
 			rf.log = rf.log[:index - rf.lastIncludedIndex]
@@ -461,6 +457,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = Min(args.LeaderCommit, rf.getLastLogIndex())
 		rf.updateLastApplied()
 	}
+
 	reply.Success = true
 }
 
@@ -474,6 +471,8 @@ func (rf *Raft) startAppendLog() {
 		go func(idx int) {
 			for {
 				rf.mu.Lock()
+
+				// Ignore if the current server isn't the leader.
 				if rf.state != Leader {
 					rf.mu.Unlock()
 					return
@@ -496,11 +495,9 @@ func (rf *Raft) startAppendLog() {
 					Entries:      append(make([]Log, 0), rf.log[rf.nextIndex[idx] - rf.lastIncludedIndex:]...),
 					LeaderCommit: rf.commitIndex,
 				}
-				reply := &AppendEntriesReply{}
 				rf.mu.Unlock()
-
-				ret := rf.sendAppendEntries(idx, &args, reply)
-
+				reply := AppendEntriesReply{}
+				ret := rf.sendAppendEntries(idx, &args, &reply)
 				rf.mu.Lock()
 
 				// compares the current term with the term you sent in your
@@ -510,6 +507,7 @@ func (rf *Raft) startAppendLog() {
 					rf.mu.Unlock()
 					return
 				}
+
 				if reply.Term > rf.currentTerm {
 					rf.beFollower(reply.Term)
 					rf.mu.Unlock()
@@ -541,16 +539,16 @@ func (rf *Raft) startAppendLog() {
 							if rf.getLog(i).Term != reply.ConflictTerm {
 								continue
 							}
+							i++
 							for i < logSize && rf.getLog(i).Term == reply.ConflictTerm {
 								i++
 							}
-							// Beyond the index of the last entry in that term in its log.
 							tarIndex = i
 						}
 					}
 
 					// The next index of the follower must not exceeding the length of the log.
-					rf.nextIndex[idx] = Min(rf.logLen(), tarIndex)
+					rf.nextIndex[idx] = Min(tarIndex, rf.logLen())
 					rf.mu.Unlock()
 				}
 			}
@@ -588,7 +586,6 @@ func (rf *Raft) updateLastApplied() {
 			CommandValid: true,
 			Command:      curLog.Command,
 			CommandIndex: rf.lastApplied,
-			UseSnapShot: false,
 			SnapShot: nil,
 		}
 		rf.applyCh <- applyMsg
@@ -856,26 +853,34 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapShotArgs, reply *InstallSnapsho
 		return
 	}
 
-	applyMsg := ApplyMsg{CommandValid: false, UseSnapShot: true, SnapShot: args.Data}
+	applyMsg := ApplyMsg{CommandValid: false, SnapShot: args.Data}
 
 	// If existing log entry has same index and term as snapshot's last included entry,
 	// retain log entries following it and reply.
-	// This means that the argument's lastIncludedLogIndex will
-	// fall within the log's indices.
-	if args.LastIncludedIndex < rf.logLen() - 1 {
+	// Otherwise, discard all the entries but keep a single log entry for metadata.
+	if args.LastIncludedIndex < rf.logLen() - 1 && rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
 		rf.log = append(make([]Log, 0), rf.log[args.LastIncludedIndex - rf.lastIncludedIndex:]...)
 	} else {
-		rf.log = []Log{{Term: args.LastIncludedTerm, Command: nil}}
+		rf.log = []Log{{Term: args.LastIncludedTerm}}
+		rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
 	}
 
 	// Reset the state machine using snapshot contents and load snapshot's cluster configuration.
+	// Also, updates the lastApplied and commit index.
 	rf.lastIncludedIndex, rf.lastIncludedTerm = args.LastIncludedIndex, args.LastIncludedTerm
 	rf.persistWithSnapShot(args.Data)
-	rf.commitIndex = Max(rf.commitIndex, args.LastIncludedIndex)
 	rf.lastApplied = Max(rf.lastApplied, args.LastIncludedIndex)
+	rf.commitIndex = Max(rf.commitIndex, args.LastIncludedIndex)
 
 	// If the snapshot's db has an older version than the current kv server,
 	// then return without installing the outdated version snapshot.
+	// If the snapshot's db has an older version than the current kv server,
+	// then return without installing the outdated version snapshot.
+	// If "last applied" has a greater value than the last included index,
+	// that means what the snapshot contains is already included in the
+	// current server's state, so we don't need to send the out-dated snapshot
+	// through the apply channel and read from it, because we've already got
+	// up-to-date state.
 	if rf.lastApplied > rf.lastIncludedIndex {
 		return
 	}
@@ -917,4 +922,26 @@ func (rf *Raft) sendSnapshot(server int) {
 	// Also, inside the following function, it will also update the
 	// commit index and the last applied of the follower.
 	rf.updateNextMatchIndex(server, rf.lastIncludedIndex)
+}
+
+// Excluding the old log entries and persist with the given snapshot.
+func (rf *Raft) DoSnapShot(curIdx int, snapshot []byte)  {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Every log entries preceding the "curIdx" must be discarded,
+	// so this boundary check is necessary.
+	if curIdx <= rf.lastIncludedIndex {
+		return
+	}
+
+	newLog := make([]Log, 0)
+	newLog = append(newLog, rf.log[curIdx - rf.lastIncludedIndex:]...)
+
+	// update last include index and term'
+	rf.lastIncludedIndex = curIdx
+	rf.lastIncludedTerm = rf.getLog(curIdx).Term
+	rf.log = newLog
+
+	rf.persistWithSnapShot(snapshot)
 }

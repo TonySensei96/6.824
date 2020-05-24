@@ -174,7 +174,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				// If the apply message tells the kv server to read from a
 				// snapshot, then read from the snapshot and continue
 				// the applied loop.
-				if applyMsg.UseSnapShot {
+				if !applyMsg.CommandValid {
 					kv.readSnapShot(applyMsg.SnapShot)
 					continue
 				}
