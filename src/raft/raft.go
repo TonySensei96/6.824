@@ -279,8 +279,9 @@ func (rf *Raft) startElection() {
 				// then a leader is granted for the current server
 				if atomic.LoadInt32(&votes) > int32(len(rf.peers)/2) {
 					rf.beLeader() // update status
+					rf.startAppendLog()
 					// sending out heartbeats immediately after winning election
-					send(rf.appendLogCh)
+					send(rf.voteCh)
 				}
 			}
 		}(i)
@@ -380,13 +381,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer send(rf.appendLogCh)
 
 	// all servers rules
 	// Set the current server as follower and keep term up-to-date
 	if args.Term > rf.currentTerm {
 		rf.beFollower(args.Term)
 	}
+	send(rf.appendLogCh)
 
 	reply.Term = rf.currentTerm
 	reply.ConflictIndex = 0
@@ -539,7 +540,6 @@ func (rf *Raft) startAppendLog() {
 							if rf.getLog(i).Term != reply.ConflictTerm {
 								continue
 							}
-							i++
 							for i < logSize && rf.getLog(i).Term == reply.ConflictTerm {
 								i++
 							}
@@ -658,7 +658,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		}
 		rf.log = append(rf.log, newLog)
-		rf.persist()
+		rf.updateCommitIndex() // Update the commit index and apply the logs of the leader.
+		rf.persist() // Leader persist state.
 		rf.startAppendLog()
 	}
 
@@ -754,8 +755,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 			// For leader, repeat during idle periods to prevent election timeout
 			case Leader:
-				rf.startAppendLog() // sends heartbeats periodically
 				time.Sleep(heartbeatTime)
+				rf.startAppendLog() // sends heartbeats periodically
 			}
 		}
 	}()
@@ -766,11 +767,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // Change the server state to candidate for new election
 func (rf *Raft) beCandidate() {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.persist() // Use lock to protech persist
-	rf.mu.Unlock()
 	go rf.startElection()
 }
 
@@ -858,11 +859,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapShotArgs, reply *InstallSnapsho
 	// If existing log entry has same index and term as snapshot's last included entry,
 	// retain log entries following it and reply.
 	// Otherwise, discard all the entries but keep a single log entry for metadata.
-	if args.LastIncludedIndex < rf.logLen() - 1 && rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
+	if args.LastIncludedIndex < rf.logLen() - 1 {
 		rf.log = append(make([]Log, 0), rf.log[args.LastIncludedIndex - rf.lastIncludedIndex:]...)
 	} else {
-		rf.log = []Log{{Term: args.LastIncludedTerm}}
-		rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
+		rf.log = []Log{{Term: args.LastIncludedTerm, Command: nil}}
 	}
 
 	// Reset the state machine using snapshot contents and load snapshot's cluster configuration.
@@ -935,13 +935,11 @@ func (rf *Raft) DoSnapShot(curIdx int, snapshot []byte)  {
 		return
 	}
 
-	newLog := make([]Log, 0)
-	newLog = append(newLog, rf.log[curIdx - rf.lastIncludedIndex:]...)
+	rf.log = append(make([]Log, 0), rf.log[curIdx - rf.lastIncludedIndex:]...)
 
 	// update last include index and term'
 	rf.lastIncludedIndex = curIdx
 	rf.lastIncludedTerm = rf.getLog(curIdx).Term
-	rf.log = newLog
 
 	rf.persistWithSnapShot(snapshot)
 }

@@ -273,7 +273,7 @@ func (kv *KVServer) readSnapShot(snapshot []byte) {
 func (kv *KVServer) needSnapshot() bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	return kv.maxraftstate > 0 && kv.maxraftstate - kv.persist.RaftStateSize() < 1
+	return kv.maxraftstate > 0 && kv.maxraftstate - kv.persist.RaftStateSize() < kv.maxraftstate / 10
 }
 
 // Encodes the database and the sequence number map for each client request

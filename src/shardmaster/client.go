@@ -4,14 +4,23 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "labrpc"
+import (
+	"labrpc"
+	"sync"
+)
 import "time"
 import "crypto/rand"
 import "math/big"
 
+const RetryInterval = time.Duration(30 * time.Millisecond)
+
 type Clerk struct {
-	servers []*labrpc.ClientEnd
+	servers 	[]*labrpc.ClientEnd
 	// Your data here.
+	id 			int64 // Unique identifier for the client.
+	seqNum		int	  // Monotonically increasing sequence number for the client's request.
+	lastLeader 	int   // Memorizing the last leader who is serving in the raft for the client.
+	mu          sync.Mutex
 }
 
 func nrand() int64 {
@@ -25,77 +34,100 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.id = nrand() // Random number for the client's unique identifier.
+	ck.seqNum = 0 // initial sequence number for each operation.
+	ck.lastLeader = 0
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
+	args := QueryArgs{Num: num}  // Initializes a new reply object.
+	ck.mu.Lock()
+	index := ck.lastLeader
+	ck.mu.Unlock()
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply QueryReply
-			ok := srv.Call("ShardMaster.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
-			}
+		var reply QueryReply // Unique reply from each server.
+		// If there is a reply from the server and the reply implies correct leader,
+		// then it means the reply is positive and just reply the configuration.
+		if ck.servers[index].Call("ShardMaster.Query", &args, &reply) && !reply.WrongLeader {
+			ck.mu.Lock()
+			ck.lastLeader = index
+			ck.mu.Unlock()
+			return reply.Config
 		}
-		time.Sleep(100 * time.Millisecond)
+		index = (index + 1) % len(ck.servers) // Try next server.
+		time.Sleep(RetryInterval)
 	}
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
-
+	ck.mu.Lock()
+	args := JoinArgs{
+		Servers: 	servers,
+		Cid: 		ck.id,
+		SeqNum: 	ck.seqNum,
+	}
+	ck.seqNum++
+	index := ck.lastLeader
+	ck.mu.Unlock()
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
-			var reply JoinReply
-			ok := srv.Call("ShardMaster.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		var reply JoinReply
+		if ck.servers[index].Call("ShardMaster.Join", &args, &reply) && !reply.WrongLeader {
+			ck.mu.Lock()
+			ck.lastLeader = index
+			ck.mu.Unlock()
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		index = (index + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
 	}
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
-
+	ck.mu.Lock()
+	args := LeaveArgs{
+		GIDs: gids,
+		Cid: ck.id,
+		SeqNum: ck.seqNum,
+	}
+	ck.seqNum++
+	index := ck.lastLeader
+	ck.mu.Unlock()
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply LeaveReply
-			ok := srv.Call("ShardMaster.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		var reply LeaveReply
+		if ck.servers[index].Call("ShardMaster.Leave", &args, &reply) && !reply.WrongLeader {
+			ck.mu.Lock()
+			ck.lastLeader = index
+			ck.mu.Unlock()
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		index = (index + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
 	}
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
-
+	ck.mu.Lock()
+	args := MoveArgs{
+		Shard: shard,
+		GID: gid,
+		Cid: ck.id,
+		SeqNum: ck.seqNum,
+	}
+	ck.seqNum++
+	index := ck.lastLeader
+	ck.mu.Unlock()
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
-			var reply MoveReply
-			ok := srv.Call("ShardMaster.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		var reply MoveReply
+		if ck.servers[index].Call("ShardMaster.Move", &args, &reply) && !reply.WrongLeader {
+			ck.mu.Lock()
+			ck.lastLeader = index
+			ck.mu.Unlock()
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		index = (index + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
 	}
 }

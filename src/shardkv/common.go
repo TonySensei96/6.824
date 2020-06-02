@@ -10,26 +10,25 @@ package shardkv
 //
 
 const (
-	OK            = "OK"
-	ErrNoKey      = "ErrNoKey"
-	ErrWrongGroup = "ErrWrongGroup"
+	OK            	= "OK"
+	ErrWrongGroup 	= "ErrWrongGroup"
+	ErrWrongLeader 	= "ErrWrongLeader"
 )
 
 type Err string
 
 // Put or Append
 type PutAppendArgs struct {
-	// You'll have to add definitions here.
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   	string
+	Value 	string
+	Op    	string 	// "Put" or "Append"
+	Cid	  	int64 	// client unique identifier
+	SeqNum	int 	// Each request with a monotonically increasing sequence number
 }
 
 type PutAppendReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
@@ -39,7 +38,27 @@ type GetArgs struct {
 }
 
 type GetReply struct {
-	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+type MigrateArgs struct {
+	Shard 		int
+	ConfigNum 	int
+}
+
+type MigrateReply struct {
+	Err 		Err
+	ConfigNum 	int
+	Shard 		int
+	DB 			map[string]string
+	Cid2Seq 	map[int64]int
+}
+
+// Gets the max between the given two integers.
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
 }

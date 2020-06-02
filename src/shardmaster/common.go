@@ -16,6 +16,11 @@ package shardmaster
 //
 // You will need to add fields to the RPC argument structs.
 //
+// For each client request RPC to the shard master, there should be
+// a unique client (clerk) identifier and a monotonically increasing
+// sequence number for each client request to implement duplicate
+// request detection.
+//
 
 // The number of shards.
 const NShards = 10
@@ -36,6 +41,8 @@ type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	Cid		int64 // Client unique identifier
+	SeqNum	int	  // Each request with a monotonically increasing sequence number
 }
 
 type JoinReply struct {
@@ -44,7 +51,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs 	[]int
+	Cid		int64 // Client unique identifier
+	SeqNum	int	  // Each request with a monotonically increasing sequence number
 }
 
 type LeaveReply struct {
@@ -53,8 +62,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard 	int
+	GID   	int
+	Cid		int64 // Client unique identifier
+	SeqNum	int	  // Each request with a monotonically increasing sequence number
 }
 
 type MoveReply struct {
