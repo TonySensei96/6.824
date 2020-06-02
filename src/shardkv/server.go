@@ -281,6 +281,9 @@ func (kv *ShardKV) tryGC() {
 					reply := MigrateReply{}
 					if ok := srv.Call("ShardKV.GarbageCollection", &args, &reply); ok && reply.Err == OK {
 						kv.mu.Lock()
+						// Delete the mark for garbage for this shard and
+						// this configuration (shard migration from the owner
+						// in this configuration).
 						delete(kv.garbages[cfgNum], shard)
 						if len(kv.garbages[cfgNum]) == 0 {
 							delete(kv.garbages, cfgNum)
@@ -497,9 +500,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.killCh = make(chan bool, 1)
 
-	go kv.daemon(kv.tryPollNewCfg, 50)
-	go kv.daemon(kv.tryPullShard, 80)
-	go kv.daemon(kv.tryGC, 100)
+	go kv.daemon(kv.tryPollNewCfg, 30) // Try poll for new configuration every 50 ms.
+	go kv.daemon(kv.tryPullShard, 40)	// Try pull shard for migration every 35 ms.
+	go kv.daemon(kv.tryGC, 120)			// Try do garbage collection every 80 ms.
 
 	// Applied loop to take client operations one at a time.
 	// The following code should be in a long-running go routine
